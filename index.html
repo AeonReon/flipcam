@@ -470,12 +470,12 @@
         <div style="height:6px"></div>
         <h3>Quality</h3>
         <div class="seg" id="qualitySeg">
-          <button data-q="720" class="on">720p</button>
-          <button data-q="1080">1080p</button>
+          <button data-q="720">720p</button>
+          <button data-q="1080" class="on">1080p</button>
           <button data-q="2160">4K</button>
         </div>
         <div class="hint" style="margin-top:8px">
-          Higher = sharper but heavier. iPhone runs smoothest at 720p.
+          1080p matches the iPhone's native camera. Drop to 720p only if recording stutters on an older device.
         </div>
       </div>
 
@@ -523,7 +523,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v4';
+    const APP_VERSION = 'v5';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -550,7 +550,7 @@
       autoFlipInterval: 3, // seconds
       autoFlipTimer: null,
       layout: 'single',      // single | pip | split
-      quality: 720,          // 720p default — 1080p stutters on iPhone Safari
+      quality: 1080,         // 1080p default — modern iPhones record this natively
       dualSupported: false,  // can run both cameras at once?
       mainSlot: 'A',         // A is the big one, B is PiP — toggled by swap btn
       lastBlob: null,
@@ -613,21 +613,32 @@
 
     async function ensureAudio() {
       if (state.audioTrack && state.audioTrack.readyState === 'live') return;
+      // Voice-call processors (EC/NS/AGC) are ON by default in browsers and
+      // designed for FaceTime/Zoom — they pump, clip, and squeeze ambient
+      // sound. Apple's Camera app turns them off. We do the same so video
+      // audio sounds like the room, not a phone call.
+      const camAudio = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1,        // mono — phones have a single mic
+        sampleRate: 48000,
+      };
       try {
         const audioStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 2,
-            sampleRate: 48000,
-          },
+          audio: camAudio,
           video: false,
         });
         state.audioTrack = audioStream.getAudioTracks()[0];
       } catch (e) {
-        // Mic denied — recording will be silent. Don't block the camera.
-        state.audioTrack = null;
+        // Some Android stacks reject all-false constraints. Retry with
+        // browser defaults rather than leaving the user silent.
+        try {
+          const fallback = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          state.audioTrack = fallback.getAudioTracks()[0];
+        } catch {
+          state.audioTrack = null;
+        }
       }
     }
 
@@ -944,7 +955,7 @@
       const out = buildOutputStream();
       const mime = pickMime();
       const opts = mime ? { mimeType: mime } : {};
-      opts.audioBitsPerSecond = 128000; // 128 kbps — default was tinny
+      opts.audioBitsPerSecond = 192_000; // 192 kbps — clean mono for video sound
       opts.videoBitsPerSecond = state.quality === 2160 ? 20_000_000
                               : state.quality === 1080 ? 8_000_000
                               : 5_000_000;

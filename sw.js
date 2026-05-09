@@ -1,7 +1,7 @@
 // FlipCam — Service Worker
 // Caches the shell for offline first paint. Stays out of the way of camera & recording.
 
-const CACHE = 'flipcam-v4';
+const CACHE = 'flipcam-v5';
 const SHELL = [
   '/',
   '/index.html',

@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <title>FlipCam · Dual-camera video</title>
+  <meta name="description" content="Record video using both phone cameras — flip front/back on the fly, with picture-in-picture on Android." />
+
+  <!-- PWA -->
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#FF6A57" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="FlipCam" />
+  <link rel="apple-touch-icon" href="/images/apple-touch-icon.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" href="/images/favicon.png" />
+
+  <style>
+    :root {
+      --bg-1: #FFF4EE;
+      --bg-2: #FFE2D5;
+      --ink:   #2A1F2C;
+      --ink-soft: #6E5664;
+      --accent:      #FF6A57;   /* coral red — record button */
+      --accent-deep: #E14535;
+      --teal:        #2EB8A4;   /* secondary action */
+      --teal-deep:   #1F8F80;
+      --card:        #FFFFFF;
+      --card-edge:   rgba(40,20,30,0.06);
+      --shadow:      0 12px 32px rgba(40, 20, 30, 0.18);
+      --shadow-sm:   0 4px 14px rgba(40, 20, 30, 0.10);
+      --safe-top:    env(safe-area-inset-top, 0px);
+      --safe-bot:    env(safe-area-inset-bottom, 0px);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; overflow: hidden; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, Inter, Roboto, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(165deg, var(--bg-1) 0%, var(--bg-2) 100%);
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+
+    /* ─── Stage ───────────────────────────────────────────── */
+    .stage {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .preview {
+      position: relative;
+      flex: 1;
+      overflow: hidden;
+      background: #1A1421;
+      border-radius: 0;
+    }
+
+    /* The composite canvas is the source of truth — what gets recorded */
+    canvas#composite {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Hidden video elements that drive the canvas */
+    video.feed { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; }
+
+    /* ─── Top bar ─────────────────────────────────────────── */
+    .top-bar {
+      position: absolute;
+      top: calc(var(--safe-top) + 12px);
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 5;
+      pointer-events: none;
+    }
+
+    .pill {
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: rgba(255, 255, 255, 0.82);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      box-shadow: var(--shadow-sm);
+      border: 1px solid var(--card-edge);
+    }
+
+    .pill.recording {
+      background: var(--accent);
+      color: white;
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+
+    .pill .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--accent);
+    }
+    .pill.recording .dot { background: #FFF; }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 106, 87, 0.55); }
+      50%      { box-shadow: 0 0 0 12px rgba(255, 106, 87, 0); }
+    }
+
+    .top-icon-btn {
+      pointer-events: auto;
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      border: 1px solid var(--card-edge);
+      background: rgba(255, 255, 255, 0.82);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: var(--shadow-sm);
+      cursor: pointer;
+      transition: transform 0.15s ease;
+    }
+    .top-icon-btn:active { transform: scale(0.92); }
+    .top-icon-btn svg { width: 20px; height: 20px; }
+    .top-icon-btn.active { background: var(--teal); color: white; border-color: transparent; }
+
+    /* ─── Settings sheet ─────────────────────────────────── */
+    .sheet {
+      position: absolute;
+      top: calc(var(--safe-top) + 64px);
+      right: 12px;
+      width: min(280px, calc(100vw - 24px));
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      z-index: 10;
+      transform-origin: top right;
+      transform: scale(0.92) translateY(-8px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    .sheet.open { transform: scale(1) translateY(0); opacity: 1; pointer-events: auto; }
+
+    .sheet h3 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); margin-bottom: 10px; }
+    .sheet .row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--card-edge); }
+    .sheet .row:last-child { border-bottom: none; }
+    .sheet .row .label { font-size: 14px; font-weight: 500; }
+    .sheet .row .hint { font-size: 11px; color: var(--ink-soft); margin-top: 2px; }
+
+    /* Toggle switch */
+    .toggle {
+      width: 44px; height: 26px;
+      background: #DDD;
+      border-radius: 999px;
+      position: relative;
+      cursor: pointer;
+      transition: background 0.2s ease;
+      flex-shrink: 0;
+    }
+    .toggle::after {
+      content: "";
+      position: absolute;
+      top: 3px; left: 3px;
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: white;
+      transition: left 0.2s ease;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.18);
+    }
+    .toggle.on { background: var(--teal); }
+    .toggle.on::after { left: 21px; }
+    .toggle.disabled { opacity: 0.4; pointer-events: none; }
+
+    /* Number stepper */
+    .stepper { display: flex; align-items: center; gap: 8px; }
+    .stepper button {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      border: none;
+      background: var(--bg-2);
+      color: var(--ink);
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .stepper button:active { background: var(--accent); color: white; }
+    .stepper .val { min-width: 36px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    .seg {
+      display: flex;
+      background: var(--bg-2);
+      border-radius: 999px;
+      padding: 3px;
+      gap: 2px;
+    }
+    .seg button {
+      flex: 1;
+      padding: 6px 12px;
+      border: none;
+      background: transparent;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink-soft);
+      cursor: pointer;
+    }
+    .seg button.on { background: white; color: var(--ink); box-shadow: var(--shadow-sm); }
+
+    /* ─── Bottom controls ─────────────────────────────────── */
+    .controls {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      padding: 18px 22px calc(var(--safe-bot) + 22px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 5;
+      background: linear-gradient(180deg, transparent 0%, rgba(255, 244, 238, 0.9) 50%, var(--bg-1) 100%);
+    }
+
+    .side-btn {
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      border: 1px solid var(--card-edge);
+      background: white;
+      box-shadow: var(--shadow-sm);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: transform 0.12s ease;
+    }
+    .side-btn:active { transform: scale(0.92); }
+    .side-btn svg { width: 26px; height: 26px; color: var(--ink); }
+    .side-btn:disabled { opacity: 0.4; pointer-events: none; }
+
+    .record-btn {
+      width: 78px; height: 78px;
+      border-radius: 50%;
+      border: 4px solid white;
+      background: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent), var(--shadow);
+      cursor: pointer;
+      position: relative;
+      transition: transform 0.12s ease;
+    }
+    .record-btn:active { transform: scale(0.92); }
+    .record-btn.recording {
+      background: white;
+    }
+    .record-btn.recording::after {
+      content: "";
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 28px; height: 28px;
+      transform: translate(-50%, -50%);
+      background: var(--accent);
+      border-radius: 6px;
+    }
+
+    /* ─── Empty / permission state ───────────────────────── */
+    .start-card {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 28px;
+      background: linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
+      z-index: 20;
+    }
+    .start-card .logo {
+      width: 96px; height: 96px;
+      margin-bottom: 22px;
+    }
+    .start-card h1 { font-size: 32px; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 6px; }
+    .start-card p { font-size: 15px; color: var(--ink-soft); max-width: 280px; line-height: 1.45; margin-bottom: 22px; }
+    .start-card .start-btn {
+      background: var(--accent);
+      color: white;
+      font-size: 16px;
+      font-weight: 700;
+      padding: 14px 28px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+      transition: transform 0.12s ease;
+    }
+    .start-card .start-btn:active { transform: scale(0.96); }
+    .start-card .err {
+      margin-top: 18px;
+      padding: 10px 14px;
+      background: #FFEAEA;
+      color: var(--accent-deep);
+      border-radius: 12px;
+      font-size: 13px;
+      max-width: 320px;
+    }
+
+    /* ─── Result modal ────────────────────────────────────── */
+    .result {
+      position: absolute;
+      inset: 0;
+      background: rgba(20, 12, 18, 0.85);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 22px;
+      z-index: 30;
+    }
+    .result.open { display: flex; }
+    .result video {
+      width: 100%;
+      max-width: 480px;
+      max-height: 60vh;
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      background: black;
+    }
+    .result .actions {
+      margin-top: 22px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .result .actions button {
+      padding: 14px 22px;
+      font-size: 15px;
+      font-weight: 700;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-secondary { background: white; color: var(--ink); }
+    .btn-ghost { background: rgba(255,255,255,0.18); color: white; border: 1px solid rgba(255,255,255,0.3) !important; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: calc(var(--safe-bot) + 120px);
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: rgba(20, 12, 18, 0.92);
+      color: white;
+      padding: 12px 20px;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 500;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      z-index: 50;
+      max-width: 80%;
+      text-align: center;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* Version pill */
+    .version-pill {
+      position: fixed;
+      bottom: 6px;
+      right: 8px;
+      font-size: 9px;
+      color: var(--ink-soft);
+      opacity: 0.5;
+      z-index: 100;
+      pointer-events: none;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Update banner */
+    .update-banner {
+      position: fixed;
+      bottom: calc(var(--safe-bot) + 12px);
+      left: 12px; right: 12px;
+      background: var(--ink);
+      color: white;
+      padding: 12px 18px;
+      border-radius: 14px;
+      font-size: 14px;
+      font-weight: 600;
+      text-align: center;
+      box-shadow: var(--shadow);
+      z-index: 200;
+      cursor: pointer;
+      display: none;
+    }
+    .update-banner.show { display: block; }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="preview" id="preview">
+      <canvas id="composite"></canvas>
+      <video class="feed" id="feedA" autoplay playsinline muted></video>
+      <video class="feed" id="feedB" autoplay playsinline muted></video>
+
+      <!-- Top bar: timer + settings -->
+      <div class="top-bar">
+        <div class="pill" id="timerPill">
+          <span class="dot"></span>
+          <span id="timerText">00:00</span>
+        </div>
+        <button class="top-icon-btn" id="settingsBtn" aria-label="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+
+      <!-- Settings sheet -->
+      <div class="sheet" id="sheet">
+        <h3>Layout</h3>
+        <div class="seg" id="layoutSeg">
+          <button data-layout="single" class="on">Single</button>
+          <button data-layout="pip">PiP</button>
+          <button data-layout="split">Split</button>
+        </div>
+        <div style="height:14px"></div>
+        <h3>Auto-flip</h3>
+        <div class="row">
+          <div>
+            <div class="label">Alternate cameras</div>
+            <div class="hint">Auto-swap during recording</div>
+          </div>
+          <div class="toggle" id="autoFlipToggle"></div>
+        </div>
+        <div class="row" id="intervalRow" style="opacity: 0.5">
+          <div>
+            <div class="label">Every</div>
+            <div class="hint">Seconds between flips</div>
+          </div>
+          <div class="stepper">
+            <button id="intervalDown">−</button>
+            <span class="val" id="intervalVal">3s</span>
+            <button id="intervalUp">+</button>
+          </div>
+        </div>
+        <div style="height:6px"></div>
+        <h3>Quality</h3>
+        <div class="seg" id="qualitySeg">
+          <button data-q="720">720p</button>
+          <button data-q="1080" class="on">1080p</button>
+          <button data-q="2160">4K</button>
+        </div>
+      </div>
+
+      <!-- Bottom controls -->
+      <div class="controls">
+        <button class="side-btn" id="flipBtn" aria-label="Flip camera">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h6l2-3h2l2 3h6v13H3z"/><circle cx="12" cy="13" r="3.5"/><path d="M8 11l-2 2 2 2M16 11l2 2-2 2" stroke-width="1.7"/></svg>
+        </button>
+        <button class="record-btn" id="recordBtn" aria-label="Record"></button>
+        <button class="side-btn" id="swapBtn" aria-label="Swap main/PiP">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 21l-4-4 4-4"/><path d="M20 17H4"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Permission / start gate -->
+    <div class="start-card" id="startCard">
+      <svg class="logo" viewBox="0 0 96 96" fill="none">
+        <rect x="4" y="4" width="88" height="88" rx="22" fill="#FF6A57"/>
+        <circle cx="58" cy="50" r="22" fill="#FFF4EE"/>
+        <circle cx="58" cy="50" r="14" fill="#2A1F2C"/>
+        <circle cx="36" cy="68" r="13" fill="#2EB8A4" stroke="#FFF4EE" stroke-width="3"/>
+        <path d="M30 68h12M36 62v12" stroke="#FFF4EE" stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+      <h1>FlipCam</h1>
+      <p>Record video using both phone cameras. Tap flip mid-recording to swap front/back.</p>
+      <button class="start-btn" id="startBtn">Start camera</button>
+      <div class="err" id="errBox" style="display:none"></div>
+    </div>
+
+    <!-- Result preview -->
+    <div class="result" id="result">
+      <video id="resultVideo" controls playsinline></video>
+      <div class="actions">
+        <button class="btn-primary" id="saveBtn">Save</button>
+        <button class="btn-secondary" id="newBtn">Record another</button>
+        <button class="btn-ghost" id="closeBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="version-pill" id="versionPill">v1</div>
+  <div class="update-banner" id="updateBanner">🔄 New version — tap to reload</div>
+
+  <script>
+    // ─── App version (bump manually on ship) ─────────────────
+    const APP_VERSION = 'v1';
+    document.getElementById('versionPill').textContent = APP_VERSION;
+
+    // ─── State ──────────────────────────────────────────────
+    const state = {
+      // Audio is acquired once and reused for the whole session — flipping
+      // the video camera must NOT stop the audio track or the recorder
+      // would lose sound mid-clip.
+      audioTrack: null,
+      streamA: null,        // primary VIDEO stream (no audio)
+      streamB: null,        // secondary VIDEO stream — only when dualSupported
+      facingA: 'user',      // 'user' | 'environment'
+      facingB: 'environment',
+      videoA: document.getElementById('feedA'),
+      videoB: document.getElementById('feedB'),
+      canvas: document.getElementById('composite'),
+      ctx: null,
+      drawing: false,
+      recording: false,
+      recorder: null,
+      chunks: [],
+      startedAt: 0,
+      timerInterval: null,
+      autoFlip: false,
+      autoFlipInterval: 3, // seconds
+      autoFlipTimer: null,
+      layout: 'single',      // single | pip | split
+      quality: 1080,
+      dualSupported: false,  // can run both cameras at once?
+      mainSlot: 'A',         // A is the big one, B is PiP — toggled by swap btn
+      lastBlob: null,
+      iosPwa: false,
+    };
+
+    state.ctx = state.canvas.getContext('2d', { alpha: false });
+
+    // iOS standalone PWA detection (memory: audio.play needs gesture on iOS PWA)
+    state.iosPwa = window.navigator.standalone === true;
+
+    // ─── Helpers ────────────────────────────────────────────
+    const $ = (id) => document.getElementById(id);
+
+    function toast(msg, ms = 2200) {
+      const t = $('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      clearTimeout(t._h);
+      t._h = setTimeout(() => t.classList.remove('show'), ms);
+    }
+
+    function fmtTime(sec) {
+      const m = Math.floor(sec / 60).toString().padStart(2, '0');
+      const s = Math.floor(sec % 60).toString().padStart(2, '0');
+      return `${m}:${s}`;
+    }
+
+    // ─── Camera management ─────────────────────────────────
+    function videoConstraints(facingOrId) {
+      const q = state.quality;
+      const v = {
+        width:  { ideal: q === 2160 ? 3840 : q === 1080 ? 1920 : 1280 },
+        height: { ideal: q === 2160 ? 2160 : q === 1080 ? 1080 : 720 },
+      };
+      if (facingOrId.deviceId) v.deviceId = { exact: facingOrId.deviceId };
+      else                     v.facingMode = { ideal: facingOrId.facing };
+      return v;
+    }
+
+    async function getVideoStream(facing) {
+      return navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: videoConstraints({ facing }),
+      });
+    }
+
+    async function getVideoStreamByDevice(deviceId) {
+      return navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: videoConstraints({ deviceId }),
+      });
+    }
+
+    async function ensureAudio() {
+      if (state.audioTrack && state.audioTrack.readyState === 'live') return;
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: true, video: false,
+        });
+        state.audioTrack = audioStream.getAudioTracks()[0];
+      } catch (e) {
+        // Mic denied — recording will be silent. Don't block the camera.
+        state.audioTrack = null;
+      }
+    }
+
+    async function detectDualSupport() {
+      // After the first getUserMedia call, enumerateDevices returns labels.
+      // Dual support = able to start a second stream from a different deviceId
+      // while the first is still running. iOS Safari refuses; Android Chrome usually allows.
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === 'videoinput');
+        if (cams.length < 2) return { ok: false, cams };
+        // We don't actually probe (it costs a stream open). Instead we attempt
+        // the second open lazily when the user picks PiP/split. For the
+        // initial layout we trust the device count + UA hint.
+        const ua = navigator.userAgent || '';
+        const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                      (ua.includes('Mac') && navigator.maxTouchPoints > 1);
+        return { ok: !isIOS && cams.length >= 2, cams };
+      } catch (e) {
+        return { ok: false, cams: [] };
+      }
+    }
+
+    function stopStream(stream) {
+      if (!stream) return;
+      stream.getTracks().forEach(t => t.stop());
+    }
+
+    async function startPrimary() {
+      try {
+        // Audio first — request mic up-front so the user grants both
+        // permissions in one go and the audio track survives camera flips.
+        await ensureAudio();
+
+        state.streamA = await getVideoStream(state.facingA);
+        state.videoA.srcObject = state.streamA;
+        await state.videoA.play().catch(() => {});
+
+        const dual = await detectDualSupport();
+        state.dualSupported = dual.ok;
+        state.cams = dual.cams;
+
+        // Auto-attempt secondary stream if dual is supported and layout != single
+        if (state.dualSupported && state.layout !== 'single') {
+          await trySecondary();
+        }
+
+        sizeCanvas();
+        beginDrawLoop();
+        return true;
+      } catch (e) {
+        showError(humanCamError(e));
+        return false;
+      }
+    }
+
+    async function trySecondary() {
+      if (!state.dualSupported) return false;
+      try {
+        const usingId = state.streamA?.getVideoTracks()[0]?.getSettings()?.deviceId;
+        const candidates = (state.cams || []).filter(c => c.deviceId && c.deviceId !== usingId);
+        if (!candidates.length) return false;
+        const wantBack = state.facingA === 'user';
+        const target = candidates.find(c => /back|rear|environment/i.test(c.label) === wantBack)
+                     || candidates[0];
+        state.streamB = await getVideoStreamByDevice(target.deviceId);
+        state.videoB.srcObject = state.streamB;
+        await state.videoB.play().catch(() => {});
+        state.facingB = wantBack ? 'environment' : 'user';
+        return true;
+      } catch (e) {
+        state.dualSupported = false;
+        return false;
+      }
+    }
+
+    let flipInProgress = false;
+    async function flipCamera() {
+      if (flipInProgress) return;        // ignore rapid re-taps
+      flipInProgress = true;
+      try {
+        if (!state.dualSupported || state.layout === 'single') {
+          // Single mode: replace videoA's stream with the opposite camera.
+          // Audio is on a separate track and is NOT touched, so the recorder
+          // keeps capturing sound across the flip.
+          const next = state.facingA === 'user' ? 'environment' : 'user';
+          const old = state.streamA;
+          const fresh = await getVideoStream(next);
+          state.streamA = fresh;
+          state.facingA = next;
+          state.videoA.srcObject = fresh;
+          await state.videoA.play().catch(() => {});
+          stopStream(old);
+        } else {
+          // Dual: just swap which slot is "main"
+          state.mainSlot = state.mainSlot === 'A' ? 'B' : 'A';
+        }
+      } catch (e) {
+        toast("Couldn't switch camera");
+      } finally {
+        flipInProgress = false;
+      }
+    }
+
+    function humanCamError(e) {
+      const name = e?.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError')
+        return 'Camera permission was denied. Open Settings → Safari → Camera and allow it for this site.';
+      if (name === 'NotFoundError') return 'No camera found on this device.';
+      if (name === 'NotReadableError') return 'The camera is busy in another app. Close other camera apps and retry.';
+      if (name === 'OverconstrainedError') return 'This phone can\'t hit that resolution. Try lowering the quality.';
+      return 'Camera failed to start. Reload and try again.';
+    }
+
+    function showError(msg) {
+      const box = $('errBox');
+      box.style.display = 'block';
+      box.textContent = msg;
+    }
+
+    // ─── Canvas draw loop ──────────────────────────────────
+    function sizeCanvas() {
+      // Match the canvas to a high-quality 9:16 portrait at the chosen quality,
+      // but display it via CSS to fill the preview area. The recorder captures
+      // from the canvas, so its pixel dimensions = output resolution.
+      const q = state.quality;
+      // Portrait video output
+      state.canvas.width  = q === 2160 ? 2160 : q === 1080 ? 1080 : 720;
+      state.canvas.height = q === 2160 ? 3840 : q === 1080 ? 1920 : 1280;
+    }
+
+    function beginDrawLoop() {
+      if (state.drawing) return;
+      state.drawing = true;
+      const tick = () => {
+        if (!state.drawing) return;
+        drawFrame();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+
+    function drawFrame() {
+      const ctx = state.ctx;
+      const W = state.canvas.width;
+      const H = state.canvas.height;
+
+      // Decide which feed is "main" and which is "second"
+      const feeds = {
+        A: { video: state.videoA, mirror: state.facingA === 'user' },
+        B: { video: state.videoB, mirror: state.facingB === 'user' },
+      };
+      const main = feeds[state.mainSlot];
+      const second = feeds[state.mainSlot === 'A' ? 'B' : 'A'];
+
+      ctx.fillStyle = '#1A1421';
+      ctx.fillRect(0, 0, W, H);
+
+      const dualLive = state.dualSupported &&
+                       state.streamB &&
+                       state.videoB.readyState >= 2;
+
+      if (state.layout === 'split' && dualLive) {
+        // Top half: main, bottom half: second
+        drawCover(ctx, main.video, 0, 0, W, H / 2, main.mirror);
+        drawCover(ctx, second.video, 0, H / 2, W, H / 2, second.mirror);
+      } else if (state.layout === 'pip' && dualLive) {
+        drawCover(ctx, main.video, 0, 0, W, H, main.mirror);
+        // PiP overlay top-right, ~28% width, with rounded mask
+        const pw = Math.round(W * 0.28);
+        const ph = Math.round(pw * 16 / 9);
+        const px = W - pw - Math.round(W * 0.04);
+        const py = Math.round(W * 0.04);
+        drawCoverRounded(ctx, second.video, px, py, pw, ph, Math.round(pw * 0.08), second.mirror);
+      } else {
+        // Single mode (or dual not yet active)
+        drawCover(ctx, main.video, 0, 0, W, H, main.mirror);
+      }
+    }
+
+    function drawCover(ctx, video, x, y, w, h, mirror) {
+      if (!video || video.readyState < 2) return;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return;
+      // Cover-fit
+      const targetRatio = w / h;
+      const vRatio = vw / vh;
+      let sx, sy, sw, sh;
+      if (vRatio > targetRatio) {
+        sh = vh;
+        sw = vh * targetRatio;
+        sx = (vw - sw) / 2;
+        sy = 0;
+      } else {
+        sw = vw;
+        sh = vw / targetRatio;
+        sx = 0;
+        sy = (vh - sh) / 2;
+      }
+      ctx.save();
+      if (mirror) {
+        ctx.translate(x + w, y);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+      } else {
+        ctx.drawImage(video, sx, sy, sw, sh, x, y, w, h);
+      }
+      ctx.restore();
+    }
+
+    function drawCoverRounded(ctx, video, x, y, w, h, r, mirror) {
+      ctx.save();
+      // Rounded rect path
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+      ctx.clip();
+      drawCover(ctx, video, x, y, w, h, mirror);
+      ctx.restore();
+      // Border
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = Math.max(2, w * 0.012);
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ─── Recording ──────────────────────────────────────────
+    function pickMime() {
+      const candidates = [
+        'video/mp4;codecs=h264,aac',
+        'video/mp4',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
+      ];
+      for (const c of candidates) {
+        if (window.MediaRecorder?.isTypeSupported?.(c)) return c;
+      }
+      return '';
+    }
+
+    function buildOutputStream() {
+      const canvasStream = state.canvas.captureStream(30);
+      if (state.audioTrack && state.audioTrack.readyState === 'live') {
+        canvasStream.addTrack(state.audioTrack);
+      }
+      return canvasStream;
+    }
+
+    function startRecording() {
+      const out = buildOutputStream();
+      const mime = pickMime();
+      try {
+        state.recorder = new MediaRecorder(out, mime ? { mimeType: mime } : undefined);
+      } catch (e) {
+        toast('Recording isn\'t supported on this browser');
+        return;
+      }
+      state.chunks = [];
+      state.recorder.ondataavailable = e => {
+        if (e.data && e.data.size) state.chunks.push(e.data);
+      };
+      state.recorder.onstop = () => {
+        const type = state.recorder.mimeType || 'video/webm';
+        const blob = new Blob(state.chunks, { type });
+        state.lastBlob = blob;
+        showResult(blob);
+      };
+      state.recorder.start(1000); // gather chunks every 1s
+      state.recording = true;
+      state.startedAt = Date.now();
+
+      $('recordBtn').classList.add('recording');
+      $('timerPill').classList.add('recording');
+      state.timerInterval = setInterval(() => {
+        const sec = Math.floor((Date.now() - state.startedAt) / 1000);
+        $('timerText').textContent = fmtTime(sec);
+      }, 250);
+
+      if (state.autoFlip) startAutoFlipTimer();
+    }
+
+    function stopRecording() {
+      if (!state.recording) return;
+      state.recording = false;
+      try { state.recorder.stop(); } catch {}
+      clearInterval(state.timerInterval);
+      stopAutoFlipTimer();
+      $('recordBtn').classList.remove('recording');
+      $('timerPill').classList.remove('recording');
+      $('timerText').textContent = '00:00';
+    }
+
+    function startAutoFlipTimer() {
+      stopAutoFlipTimer();
+      state.autoFlipTimer = setInterval(() => {
+        flipCamera();
+      }, state.autoFlipInterval * 1000);
+    }
+    function stopAutoFlipTimer() {
+      if (state.autoFlipTimer) clearInterval(state.autoFlipTimer);
+      state.autoFlipTimer = null;
+    }
+
+    // ─── Result modal ──────────────────────────────────────
+    function showResult(blob) {
+      const url = URL.createObjectURL(blob);
+      const v = $('resultVideo');
+      v.src = url;
+      $('result').classList.add('open');
+    }
+
+    function closeResult() {
+      const v = $('resultVideo');
+      v.pause();
+      if (v.src) URL.revokeObjectURL(v.src);
+      v.src = '';
+      $('result').classList.remove('open');
+    }
+
+    async function saveRecording() {
+      if (!state.lastBlob) return;
+      const ext = state.lastBlob.type.includes('mp4') ? 'mp4' : 'webm';
+      const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      const filename = `flipcam-${ts}.${ext}`;
+      const file = new File([state.lastBlob], filename, { type: state.lastBlob.type });
+
+      // iOS PWA: Web Share API saves to camera roll via share sheet
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], title: 'FlipCam recording' });
+          toast('Saved');
+          return;
+        } catch (e) {
+          if (e?.name === 'AbortError') return; // user cancelled
+        }
+      }
+
+      // Fallback: anchor download
+      const url = URL.createObjectURL(state.lastBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      toast('Downloaded');
+    }
+
+    // ─── UI wiring ─────────────────────────────────────────
+    $('startBtn').addEventListener('click', async () => {
+      $('errBox').style.display = 'none';
+      const ok = await startPrimary();
+      if (ok) {
+        $('startCard').style.display = 'none';
+        if (!state.dualSupported) {
+          // Hide swap btn (only relevant when dual streams are running)
+          $('swapBtn').style.display = 'none';
+        }
+        // Disable PiP/Split layout buttons if dual not supported — but on
+        // iOS Safari the fast-flip alternate is still useful in single mode.
+        if (!state.dualSupported) {
+          document.querySelectorAll('#layoutSeg button').forEach(b => {
+            if (b.dataset.layout !== 'single') {
+              b.disabled = true;
+              b.style.opacity = '0.4';
+              b.title = 'iOS Safari only allows one camera at a time';
+            }
+          });
+        }
+      }
+    });
+
+    $('recordBtn').addEventListener('click', () => {
+      if (state.recording) stopRecording();
+      else startRecording();
+    });
+
+    $('flipBtn').addEventListener('click', () => flipCamera());
+
+    $('swapBtn').addEventListener('click', () => {
+      if (!state.dualSupported) {
+        toast('Dual cameras not available on this device');
+        return;
+      }
+      state.mainSlot = state.mainSlot === 'A' ? 'B' : 'A';
+    });
+
+    $('settingsBtn').addEventListener('click', () => {
+      $('sheet').classList.toggle('open');
+    });
+
+    document.addEventListener('click', (e) => {
+      const sheet = $('sheet');
+      if (!sheet.classList.contains('open')) return;
+      if (sheet.contains(e.target) || $('settingsBtn').contains(e.target)) return;
+      sheet.classList.remove('open');
+    });
+
+    // Layout segmented control
+    document.querySelectorAll('#layoutSeg button').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (btn.disabled) return;
+        document.querySelectorAll('#layoutSeg button').forEach(b => b.classList.remove('on'));
+        btn.classList.add('on');
+        const newLayout = btn.dataset.layout;
+        state.layout = newLayout;
+
+        if ((newLayout === 'pip' || newLayout === 'split')) {
+          if (!state.streamB && state.dualSupported) {
+            const ok = await trySecondary();
+            if (!ok) toast('Couldn\'t open both cameras at once on this device');
+          }
+        }
+      });
+    });
+
+    // Quality segmented control
+    document.querySelectorAll('#qualitySeg button').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        document.querySelectorAll('#qualitySeg button').forEach(b => b.classList.remove('on'));
+        btn.classList.add('on');
+        state.quality = parseInt(btn.dataset.q, 10);
+        sizeCanvas();
+        // Restart streams at new resolution (only if not actively recording)
+        if (state.recording) {
+          toast('Will apply on next recording');
+          return;
+        }
+        if (state.streamA) {
+          stopStream(state.streamA);
+          stopStream(state.streamB);
+          state.streamA = null;
+          state.streamB = null;
+          await startPrimary();
+        }
+      });
+    });
+
+    // Auto-flip toggle
+    $('autoFlipToggle').addEventListener('click', () => {
+      state.autoFlip = !state.autoFlip;
+      $('autoFlipToggle').classList.toggle('on', state.autoFlip);
+      $('intervalRow').style.opacity = state.autoFlip ? '1' : '0.5';
+      if (state.recording) {
+        if (state.autoFlip) startAutoFlipTimer(); else stopAutoFlipTimer();
+      }
+    });
+
+    $('intervalDown').addEventListener('click', () => {
+      state.autoFlipInterval = Math.max(1, state.autoFlipInterval - 1);
+      $('intervalVal').textContent = state.autoFlipInterval + 's';
+      if (state.recording && state.autoFlip) startAutoFlipTimer();
+    });
+    $('intervalUp').addEventListener('click', () => {
+      state.autoFlipInterval = Math.min(30, state.autoFlipInterval + 1);
+      $('intervalVal').textContent = state.autoFlipInterval + 's';
+      if (state.recording && state.autoFlip) startAutoFlipTimer();
+    });
+
+    // Result actions
+    $('saveBtn').addEventListener('click', saveRecording);
+    $('newBtn').addEventListener('click', closeResult);
+    $('closeBtn').addEventListener('click', closeResult);
+
+    // Wake-lock during recording (keeps screen on)
+    let wakeLock = null;
+    async function acquireWakeLock() {
+      try {
+        if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+      } catch {}
+    }
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState === 'visible' && state.recording) acquireWakeLock();
+    });
+
+    // ─── Build-stamp polling (PWA cache-bust) ──────────────
+    let initialStamp = null;
+    async function checkBuildStamp() {
+      try {
+        const res = await fetch('/build-stamp', { cache: 'no-store' });
+        if (!res.ok) return;
+        const { stamp } = await res.json();
+        if (initialStamp === null) initialStamp = stamp;
+        else if (stamp !== initialStamp) $('updateBanner').classList.add('show');
+      } catch {}
+    }
+    $('updateBanner').addEventListener('click', () => location.reload());
+    checkBuildStamp();
+    setInterval(checkBuildStamp, 60000);
+
+    // Service worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>

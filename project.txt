@@ -1,0 +1,54 @@
+FlipCam — Dual-camera video PWA
+================================
+
+Purpose
+-------
+Record video using both phone cameras. Like MixCam, but free, no install, opens in any browser.
+
+Core feature
+------------
+- iOS Safari (one camera at a time):
+  fast-flip mode — tap to swap front↔back, optionally auto-alternate every N seconds during recording
+- Android Chrome (true dual stream):
+  picture-in-picture or split layout, both cameras live simultaneously
+
+Output
+------
+Single MP4 (or WebM fallback) file, saved to camera roll on iOS via Web Share API,
+or downloaded normally on Android/desktop.
+
+Stack
+-----
+- Pure HTML/CSS/JS, no build step
+- MediaRecorder API → canvas.captureStream(30fps)
+- Composite drawn each frame on <canvas> (recorded surface = canvas)
+- Audio track from primary camera's getUserMedia stream
+- PWA: manifest + service worker + cache-bust block per APPS/CLAUDE.md
+
+Deploy
+------
+Vercel — stateless, zero secrets needed.
+Repo: github.com/AeonReon/flipcam (to create)
+Live URL: flipcam.vercel.app (TBC after deploy)
+
+Settings (in the gear sheet)
+-----------------------------
+- Layout: Single | PiP | Split  (PiP/Split disabled on iOS — single camera limit)
+- Auto-flip: toggle + interval stepper (1–30 s)
+- Quality: 720p | 1080p | 4K
+
+Known limits
+------------
+- iOS Safari can only run one camera stream at a time → no real PiP/Split on iPhone
+  (Native Swift app would unlock AVCaptureMultiCamSession on iPhone XS+)
+- Audio momentarily glitches on flip in single mode — MediaRecorder can't swap
+  tracks live. Acceptable for v1; native dev would solve.
+- 4K only works on phones whose camera + browser MediaRecorder supports it
+  (most modern Android Chrome do; iOS Safari typically caps at ~1080p)
+
+Future
+------
+- Native Swift wrapper (real iPhone XS+ MultiCam)
+- Filter/exposure controls
+- Per-side mute when in dual mode
+- Stream key for OBS / live to YouTube

@@ -64,17 +64,39 @@
       border-radius: 0;
     }
 
-    /* The composite canvas is the source of truth — what gets recorded */
+    /* In direct mode (single camera, default on iPhone), the video element
+       is the preview AND the recording source — no canvas in the loop, much
+       smoother. Canvas is only used in 'canvas' mode for compositing
+       multi-camera Android layouts. */
     canvas#composite {
       position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
       object-fit: cover;
+      display: none;
     }
+    .preview[data-mode="canvas"] canvas#composite { display: block; }
 
-    /* Hidden video elements that drive the canvas */
-    video.feed { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; }
+    video.feed {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      pointer-events: none;
+      display: none;
+    }
+    .preview[data-mode="direct"] video#feedA { display: block; }
+    .preview[data-mode="direct"] video#feedA.mirror { transform: scaleX(-1); }
+    /* In canvas mode, hidden feeders feed the canvas — keep them in DOM but invisible */
+    .preview[data-mode="canvas"] video.feed {
+      display: block;
+      opacity: 0;
+      width: 1px;
+      height: 1px;
+      inset: auto;
+    }
 
     /* ─── Top bar ─────────────────────────────────────────── */
     .top-bar {
@@ -334,14 +356,54 @@
       z-index: 30;
     }
     .result.open { display: flex; }
-    .result video {
+    .result-inner {
       width: 100%;
       max-width: 480px;
-      max-height: 60vh;
-      border-radius: 18px;
-      box-shadow: var(--shadow);
-      background: black;
+      max-height: 65vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 4px;
+      -webkit-overflow-scrolling: touch;
     }
+    .result-clip {
+      background: rgba(255,255,255,0.06);
+      border-radius: 18px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .result-clip video {
+      width: 100%;
+      border-radius: 12px;
+      background: black;
+      display: block;
+    }
+    .result-clip .clip-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .result-clip .clip-label {
+      color: white;
+      font-size: 13px;
+      font-weight: 600;
+      opacity: 0.9;
+    }
+    .result-clip .clip-save {
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      border-radius: 999px;
+      border: none;
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+    }
+    .result-clip .clip-save:active { transform: scale(0.95); }
     .result .actions {
       margin-top: 22px;
       display: flex;
@@ -418,7 +480,7 @@
 </head>
 <body>
   <div class="stage">
-    <div class="preview" id="preview">
+    <div class="preview" id="preview" data-mode="direct">
       <canvas id="composite"></canvas>
       <video class="feed" id="feedA" autoplay playsinline muted></video>
       <video class="feed" id="feedB" autoplay playsinline muted></video>
@@ -499,16 +561,16 @@
         <path d="M30 68h12M36 62v12" stroke="#FFF4EE" stroke-width="2.4" stroke-linecap="round"/>
       </svg>
       <h1>FlipCam</h1>
-      <p>Record video using both phone cameras. Tap flip mid-recording to swap front/back.</p>
+      <p>Record using both phone cameras. Tap flip during recording to start a fresh clip with the other camera — get all your clips at the end.</p>
       <button class="start-btn" id="startBtn">Start camera</button>
       <div class="err" id="errBox" style="display:none"></div>
     </div>
 
     <!-- Result preview -->
     <div class="result" id="result">
-      <video id="resultVideo" controls playsinline></video>
+      <div class="result-inner" id="resultInner"></div>
       <div class="actions">
-        <button class="btn-primary" id="saveBtn">Save</button>
+        <button class="btn-primary" id="saveAllBtn">Save all</button>
         <button class="btn-secondary" id="newBtn">Record another</button>
         <button class="btn-ghost" id="closeBtn">Close</button>
       </div>
@@ -521,7 +583,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v2';
+    const APP_VERSION = 'v3';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -551,10 +613,13 @@
       quality: 720,          // 720p default — 1080p stutters on iPhone Safari
       dualSupported: false,  // can run both cameras at once?
       mainSlot: 'A',         // A is the big one, B is PiP — toggled by swap btn
-      lastBlob: null,
+      segments: [],          // recorded clips (multi-segment if user flipped mid-recording)
       isIOS: false,
       iosPwa: false,
       recBusy: false,        // race-guard on record toggle
+      captureMode: 'direct', // 'direct' | 'canvas' (set by applyCaptureMode())
+      _afterSegmentStop: null,
+      _drawTimer: null,
     };
 
     state.ctx = state.canvas.getContext('2d', { alpha: false });
@@ -612,7 +677,14 @@
       if (state.audioTrack && state.audioTrack.readyState === 'live') return;
       try {
         const audioStream = await navigator.mediaDevices.getUserMedia({
-          audio: true, video: false,
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 2,
+            sampleRate: 48000,
+          },
+          video: false,
         });
         state.audioTrack = audioStream.getAudioTracks()[0];
       } catch (e) {
@@ -665,12 +737,41 @@
           await trySecondary();
         }
 
+        applyCaptureMode();
         sizeCanvas();
-        beginDrawLoop();
         return true;
       } catch (e) {
         showError(humanCamError(e));
         return false;
+      }
+    }
+
+    // ─── Capture mode (direct vs canvas) ──────────────────
+    // 'direct' = video element is preview AND recording source. Smooth, but
+    //            flip during recording produces multi-segment clips.
+    // 'canvas' = canvas pipeline, used for compositing dual streams (PiP/Split)
+    //            on Android. Heavier — accepted because dual layouts need it.
+    function decideCaptureMode() {
+      if (state.layout !== 'single' && state.dualSupported && state.streamB) {
+        return 'canvas';
+      }
+      return 'direct';
+    }
+
+    function applyCaptureMode() {
+      const mode = decideCaptureMode();
+      state.captureMode = mode;
+      $('preview').dataset.mode = mode;
+      // Mirror selfie cam preview (CSS only — recording stays unmirrored,
+      // which matches iPhone native behaviour)
+      state.videoA.classList.toggle('mirror', state.facingA === 'user');
+
+      if (mode === 'canvas') {
+        beginDrawLoop();
+      } else {
+        // Direct mode — stop the canvas draw loop to save CPU
+        state.drawing = false;
+        if (state._drawTimer) { clearInterval(state._drawTimer); state._drawTimer = null; }
       }
     }
 
@@ -695,27 +796,49 @@
     }
 
     let flipInProgress = false;
+    async function swapPrimaryCamera() {
+      const next = state.facingA === 'user' ? 'environment' : 'user';
+      const old = state.streamA;
+      const fresh = await getVideoStream(next);
+      state.streamA = fresh;
+      state.facingA = next;
+      state.videoA.srcObject = fresh;
+      state.videoA.classList.toggle('mirror', next === 'user');
+      await state.videoA.play().catch(() => {});
+      stopStream(old);
+    }
+
     async function flipCamera() {
       if (flipInProgress) return;        // ignore rapid re-taps
       flipInProgress = true;
       try {
-        if (!state.dualSupported || state.layout === 'single') {
-          // Single mode: replace videoA's stream with the opposite camera.
-          // Audio is on a separate track and is NOT touched, so the recorder
-          // keeps capturing sound across the flip.
-          const next = state.facingA === 'user' ? 'environment' : 'user';
-          const old = state.streamA;
-          const fresh = await getVideoStream(next);
-          state.streamA = fresh;
-          state.facingA = next;
-          state.videoA.srcObject = fresh;
-          await state.videoA.play().catch(() => {});
-          stopStream(old);
-        } else {
-          // Dual: just swap which slot is "main"
+        if (state.captureMode === 'canvas' && state.streamB) {
+          // Dual canvas mode: just swap which slot is "main"
           state.mainSlot = state.mainSlot === 'A' ? 'B' : 'A';
+          return;
+        }
+
+        // Direct mode (default).
+        if (state.recording) {
+          // Mid-recording: end current segment, swap, start next segment.
+          // The result is N segments saved separately (smooth video > single file).
+          await new Promise((resolve, reject) => {
+            state._afterSegmentStop = async () => {
+              state._afterSegmentStop = null;
+              try {
+                await swapPrimaryCamera();
+                startSegment();
+                resolve();
+              } catch (e) { reject(e); }
+            };
+            try { state.recorder.stop(); } catch (e) { reject(e); }
+          });
+        } else {
+          // Not recording — simple stream swap
+          await swapPrimaryCamera();
         }
       } catch (e) {
+        console.error(e);
         toast("Couldn't switch camera");
       } finally {
         flipInProgress = false;
@@ -896,25 +1019,40 @@
       return '';
     }
 
-    function buildOutputStream() {
-      const canvasStream = state.canvas.captureStream(30);
-      if (state.audioTrack && state.audioTrack.readyState === 'live') {
-        canvasStream.addTrack(state.audioTrack);
+    function buildRecordingStream() {
+      if (state.captureMode === 'canvas') {
+        const cs = state.canvas.captureStream(30);
+        if (state.audioTrack && state.audioTrack.readyState === 'live') {
+          cs.addTrack(state.audioTrack);
+        }
+        return cs;
       }
-      return canvasStream;
+      // Direct mode: video track from the live camera + the persistent audio track
+      const ds = new MediaStream();
+      const vt = state.streamA?.getVideoTracks()[0];
+      if (vt) ds.addTrack(vt);
+      if (state.audioTrack && state.audioTrack.readyState === 'live') {
+        ds.addTrack(state.audioTrack);
+      }
+      return ds;
     }
 
-    function startRecording() {
-      if (state.recBusy) return;
-      state.recBusy = true;
-      const out = buildOutputStream();
+    function startSegment() {
+      const out = buildRecordingStream();
       const mime = pickMime();
+      const opts = mime ? { mimeType: mime } : {};
+      // Bumped audio bitrate — default MediaRecorder rate sounds tinny.
+      opts.audioBitsPerSecond = 128000;
+      // Higher video bitrate → sharper, but each phone has its own ceiling.
+      opts.videoBitsPerSecond = state.quality === 2160 ? 20_000_000
+                              : state.quality === 1080 ? 8_000_000
+                              : 5_000_000;
       try {
-        state.recorder = new MediaRecorder(out, mime ? { mimeType: mime } : undefined);
+        state.recorder = new MediaRecorder(out, opts);
       } catch (e) {
-        toast("This browser can't record video");
-        state.recBusy = false;
-        return;
+        // Fallback: drop bitrate hints if unsupported
+        try { state.recorder = new MediaRecorder(out, mime ? { mimeType: mime } : undefined); }
+        catch { toast("This browser can't record video"); return; }
       }
       state.chunks = [];
       state.recorder.ondataavailable = e => {
@@ -923,20 +1061,26 @@
       state.recorder.onstop = () => {
         const type = state.recorder.mimeType || 'video/webm';
         const blob = new Blob(state.chunks, { type });
-        state.lastBlob = blob;
-        if (!blob.size) {
-          // iOS Safari occasionally produces zero-byte recordings when the
-          // pipeline is over-stressed. Tell the user instead of opening
-          // an empty result modal.
-          toast("Recording was empty — try a longer clip or lower the quality.", 3500);
-        } else {
-          showResult(blob);
-        }
-        state.recBusy = false;
+        if (blob.size) state.segments.push(blob);
+        // After-stop hook (set by flipCamera or stopRecording)
+        const after = state._afterSegmentStop;
+        state._afterSegmentStop = null;
+        if (after) after();
       };
-      // No timeslice — iOS Safari MediaRecorder is more reliable when it
-      // fires a single dataavailable on stop than when it timeslices.
       state.recorder.start();
+    }
+
+    function startRecording() {
+      if (state.recBusy) return;
+      state.recBusy = true;
+      state.segments = [];
+      try {
+        startSegment();
+      } catch (e) {
+        toast("This browser can't record video");
+        state.recBusy = false;
+        return;
+      }
       state.recording = true;
       state.startedAt = Date.now();
 
@@ -947,7 +1091,6 @@
         $('timerText').textContent = fmtTime(sec);
       }, 250);
 
-      // recBusy clears in onstop; let the user toggle stop right away
       setTimeout(() => { state.recBusy = false; }, 200);
 
       if (state.autoFlip) startAutoFlipTimer();
@@ -955,16 +1098,21 @@
 
     function stopRecording() {
       if (!state.recording) return;
-      if (state.recBusy) return;
-      state.recBusy = true;
       state.recording = false;
-      try { state.recorder.stop(); } catch {}
-      clearInterval(state.timerInterval);
       stopAutoFlipTimer();
+      clearInterval(state.timerInterval);
       $('recordBtn').classList.remove('recording');
       $('timerPill').classList.remove('recording');
       $('timerText').textContent = '00:00';
-      // recBusy clears in onstop
+
+      state._afterSegmentStop = () => {
+        if (!state.segments.length) {
+          toast("Recording was empty — try a longer clip.", 3500);
+          return;
+        }
+        showResult(state.segments);
+      };
+      try { state.recorder.stop(); } catch {}
     }
 
     function startAutoFlipTimer() {
@@ -979,41 +1127,77 @@
     }
 
     // ─── Result modal ──────────────────────────────────────
-    function showResult(blob) {
-      const url = URL.createObjectURL(blob);
-      const v = $('resultVideo');
-      v.src = url;
+    function showResult(segments) {
+      const inner = $('resultInner');
+      // Revoke any previous URLs
+      inner.querySelectorAll('video').forEach(v => v.src && URL.revokeObjectURL(v.src));
+      inner.innerHTML = '';
+
+      const multi = segments.length > 1;
+      $('saveAllBtn').textContent = multi ? `Save all ${segments.length}` : 'Save';
+
+      segments.forEach((blob, i) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'result-clip';
+        const v = document.createElement('video');
+        v.controls = true;
+        v.playsInline = true;
+        v.src = URL.createObjectURL(blob);
+        const row = document.createElement('div');
+        row.className = 'clip-row';
+        const label = document.createElement('span');
+        label.className = 'clip-label';
+        const sec = (blob.size / 1024 / 1024).toFixed(1);
+        label.textContent = multi
+          ? `Clip ${i + 1} · ${sec} MB`
+          : `${sec} MB`;
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'clip-save';
+        saveBtn.textContent = multi ? 'Save' : 'Save';
+        saveBtn.addEventListener('click', () => saveSegment(blob, i + 1));
+        row.appendChild(label);
+        row.appendChild(saveBtn);
+        wrap.appendChild(v);
+        wrap.appendChild(row);
+        inner.appendChild(wrap);
+      });
+
       $('result').classList.add('open');
     }
 
     function closeResult() {
-      const v = $('resultVideo');
-      v.pause();
-      if (v.src) URL.revokeObjectURL(v.src);
-      v.src = '';
+      const inner = $('resultInner');
+      inner.querySelectorAll('video').forEach(v => {
+        v.pause();
+        if (v.src) URL.revokeObjectURL(v.src);
+        v.src = '';
+      });
+      inner.innerHTML = '';
       $('result').classList.remove('open');
     }
 
-    async function saveRecording() {
-      if (!state.lastBlob) return;
-      const ext = state.lastBlob.type.includes('mp4') ? 'mp4' : 'webm';
+    function blobFilename(blob, i) {
+      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
       const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
-      const filename = `flipcam-${ts}.${ext}`;
-      const file = new File([state.lastBlob], filename, { type: state.lastBlob.type });
+      const tag = i ? `-clip${i}` : '';
+      return `flipcam-${ts}${tag}.${ext}`;
+    }
 
-      // iOS PWA: Web Share API saves to camera roll via share sheet
+    async function saveSegment(blob, i) {
+      const filename = blobFilename(blob, i);
+      const file = new File([blob], filename, { type: blob.type });
+
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         try {
-          await navigator.share({ files: [file], title: 'FlipCam recording' });
+          await navigator.share({ files: [file], title: 'FlipCam' });
           toast('Saved');
           return;
         } catch (e) {
-          if (e?.name === 'AbortError') return; // user cancelled
+          if (e?.name === 'AbortError') return;
         }
       }
-
       // Fallback: anchor download
-      const url = URL.createObjectURL(state.lastBlob);
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = filename;
@@ -1022,6 +1206,26 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       toast('Downloaded');
+    }
+
+    async function saveAllSegments() {
+      if (!state.segments?.length) return;
+      // Web Share supports multi-file on most platforms — try one share with all
+      const files = state.segments.map((b, i) => new File([b], blobFilename(b, state.segments.length > 1 ? i + 1 : 0), { type: b.type }));
+      if (state.segments.length > 1 && navigator.canShare && navigator.canShare({ files })) {
+        try {
+          await navigator.share({ files, title: 'FlipCam clips' });
+          toast('Saved');
+          return;
+        } catch (e) {
+          if (e?.name === 'AbortError') return;
+          // fallthrough to per-file save
+        }
+      }
+      // Per-file save loop
+      for (let i = 0; i < state.segments.length; i++) {
+        await saveSegment(state.segments[i], state.segments.length > 1 ? i + 1 : 0);
+      }
     }
 
     // ─── UI wiring ─────────────────────────────────────────
@@ -1083,6 +1287,7 @@
             if (!ok) toast('Couldn\'t open both cameras at once on this device');
           }
         }
+        applyCaptureMode();
       });
     });
 
@@ -1130,7 +1335,7 @@
     });
 
     // Result actions
-    $('saveBtn').addEventListener('click', saveRecording);
+    $('saveAllBtn').addEventListener('click', saveAllSegments);
     $('newBtn').addEventListener('click', closeResult);
     $('closeBtn').addEventListener('click', closeResult);
 

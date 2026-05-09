@@ -166,6 +166,7 @@
     .sheet .row:last-child { border-bottom: none; }
     .sheet .row .label { font-size: 14px; font-weight: 500; }
     .sheet .row .hint { font-size: 11px; color: var(--ink-soft); margin-top: 2px; }
+    .sheet .hint { font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
 
     /* Toggle switch */
     .toggle {
@@ -435,11 +436,14 @@
 
       <!-- Settings sheet -->
       <div class="sheet" id="sheet">
-        <h3>Layout</h3>
+        <h3 id="layoutHeader">Layout</h3>
         <div class="seg" id="layoutSeg">
           <button data-layout="single" class="on">Single</button>
           <button data-layout="pip">PiP</button>
           <button data-layout="split">Split</button>
+        </div>
+        <div class="hint" id="layoutNote" style="margin-top:8px; display:none">
+          iPhone Safari only allows one camera at a time. Use auto-flip below to alternate during recording.
         </div>
         <div style="height:14px"></div>
         <h3>Auto-flip</h3>
@@ -464,9 +468,12 @@
         <div style="height:6px"></div>
         <h3>Quality</h3>
         <div class="seg" id="qualitySeg">
-          <button data-q="720">720p</button>
-          <button data-q="1080" class="on">1080p</button>
+          <button data-q="720" class="on">720p</button>
+          <button data-q="1080">1080p</button>
           <button data-q="2160">4K</button>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          Higher = sharper but heavier. iPhone runs smoothest at 720p.
         </div>
       </div>
 
@@ -514,7 +521,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v1';
+    const APP_VERSION = 'v2';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -541,16 +548,21 @@
       autoFlipInterval: 3, // seconds
       autoFlipTimer: null,
       layout: 'single',      // single | pip | split
-      quality: 1080,
+      quality: 720,          // 720p default — 1080p stutters on iPhone Safari
       dualSupported: false,  // can run both cameras at once?
       mainSlot: 'A',         // A is the big one, B is PiP — toggled by swap btn
       lastBlob: null,
+      isIOS: false,
       iosPwa: false,
+      recBusy: false,        // race-guard on record toggle
     };
 
     state.ctx = state.canvas.getContext('2d', { alpha: false });
 
-    // iOS standalone PWA detection (memory: audio.play needs gesture on iOS PWA)
+    // iOS detection — Safari can only run one camera and benefits from lighter pipeline
+    const _ua = navigator.userAgent || '';
+    state.isIOS = /iPad|iPhone|iPod/.test(_ua) ||
+                  (_ua.includes('Mac') && navigator.maxTouchPoints > 1);
     state.iosPwa = window.navigator.standalone === true;
 
     // ─── Helpers ────────────────────────────────────────────
@@ -740,12 +752,28 @@
     function beginDrawLoop() {
       if (state.drawing) return;
       state.drawing = true;
-      const tick = () => {
-        if (!state.drawing) return;
-        drawFrame();
-        requestAnimationFrame(tick);
-      };
-      requestAnimationFrame(tick);
+
+      // Prefer requestVideoFrameCallback — fires only when the source
+      // video has a new frame, much lighter than rAF at 60Hz on iOS.
+      const supportsRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+      if (supportsRVFC) {
+        const onFrame = () => {
+          if (!state.drawing) return;
+          drawFrame();
+          // Re-arm on whichever feed is the main one
+          const main = state.mainSlot === 'A' ? state.videoA : state.videoB;
+          (main || state.videoA).requestVideoFrameCallback(onFrame);
+        };
+        state.videoA.requestVideoFrameCallback(onFrame);
+      } else {
+        // Fallback: 30Hz interval (matches MediaRecorder capture rate)
+        const tick = () => {
+          if (!state.drawing) return;
+          drawFrame();
+        };
+        state._drawTimer = setInterval(tick, 33);
+      }
     }
 
     function drawFrame() {
@@ -877,12 +905,15 @@
     }
 
     function startRecording() {
+      if (state.recBusy) return;
+      state.recBusy = true;
       const out = buildOutputStream();
       const mime = pickMime();
       try {
         state.recorder = new MediaRecorder(out, mime ? { mimeType: mime } : undefined);
       } catch (e) {
-        toast('Recording isn\'t supported on this browser');
+        toast("This browser can't record video");
+        state.recBusy = false;
         return;
       }
       state.chunks = [];
@@ -893,9 +924,19 @@
         const type = state.recorder.mimeType || 'video/webm';
         const blob = new Blob(state.chunks, { type });
         state.lastBlob = blob;
-        showResult(blob);
+        if (!blob.size) {
+          // iOS Safari occasionally produces zero-byte recordings when the
+          // pipeline is over-stressed. Tell the user instead of opening
+          // an empty result modal.
+          toast("Recording was empty — try a longer clip or lower the quality.", 3500);
+        } else {
+          showResult(blob);
+        }
+        state.recBusy = false;
       };
-      state.recorder.start(1000); // gather chunks every 1s
+      // No timeslice — iOS Safari MediaRecorder is more reliable when it
+      // fires a single dataavailable on stop than when it timeslices.
+      state.recorder.start();
       state.recording = true;
       state.startedAt = Date.now();
 
@@ -906,11 +947,16 @@
         $('timerText').textContent = fmtTime(sec);
       }, 250);
 
+      // recBusy clears in onstop; let the user toggle stop right away
+      setTimeout(() => { state.recBusy = false; }, 200);
+
       if (state.autoFlip) startAutoFlipTimer();
     }
 
     function stopRecording() {
       if (!state.recording) return;
+      if (state.recBusy) return;
+      state.recBusy = true;
       state.recording = false;
       try { state.recorder.stop(); } catch {}
       clearInterval(state.timerInterval);
@@ -918,6 +964,7 @@
       $('recordBtn').classList.remove('recording');
       $('timerPill').classList.remove('recording');
       $('timerText').textContent = '00:00';
+      // recBusy clears in onstop
     }
 
     function startAutoFlipTimer() {
@@ -986,17 +1033,11 @@
         if (!state.dualSupported) {
           // Hide swap btn (only relevant when dual streams are running)
           $('swapBtn').style.display = 'none';
-        }
-        // Disable PiP/Split layout buttons if dual not supported — but on
-        // iOS Safari the fast-flip alternate is still useful in single mode.
-        if (!state.dualSupported) {
+          // Hide PiP/Split entirely — they were just confusing greyed out
           document.querySelectorAll('#layoutSeg button').forEach(b => {
-            if (b.dataset.layout !== 'single') {
-              b.disabled = true;
-              b.style.opacity = '0.4';
-              b.title = 'iOS Safari only allows one camera at a time';
-            }
+            if (b.dataset.layout !== 'single') b.style.display = 'none';
           });
+          $('layoutNote').style.display = 'block';
         }
       }
     });

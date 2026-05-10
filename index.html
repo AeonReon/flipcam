@@ -532,7 +532,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v8';
+    const APP_VERSION = 'v9';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -593,9 +593,14 @@
       // the smoothing+anti-windup so they can't drift forever.
       cumPitch: 0, cumYaw: 0,
       smPitch: 0,  smYaw: 0,
-      alpha: 0.92,        // smoothing — higher = stiffer; 0.92 ≈ 12-frame lag at 60Hz
+      alpha: 0.96,        // smoothing — higher = stiffer; 0.96 ≈ 25-event tau ≈ 0.4s
+      // Slow decay on the cumulative integrators kills gyro bias drift —
+      // without this, a small constant rotationRate offset accumulates
+      // forever and the smoothed reference catches up, making compensation
+      // fade out over seconds even during continuous shake.
+      cumDecay: 0.998,
       fovDeg: 65,         // assumed horizontal FOV — tweak if compensation feels off
-      zoom: 1.14,         // 14% crop margin → ±7% shift headroom
+      zoom: 1.20,         // 20% crop margin → ±10% shift headroom for big jolts
       // Sign flags so we can flip without re-deriving the rotation math.
       // Derivation for back camera, phone in portrait:
       //   +gamma (yaw) → camera looks LEFT → scene moves RIGHT in source
@@ -635,10 +640,11 @@
         if (!GS.enabled) return;
         const rr = e.rotationRate;
         if (!rr) return;
-        const now = e.timeStamp || performance.now();
+        // performance.now() is more reliable than e.timeStamp across iOS versions.
+        const now = performance.now();
         const dt = GS.lastEventT ? (now - GS.lastEventT) / 1000 : 1 / 60;
         GS.lastEventT = now;
-        if (dt <= 0 || dt > 0.2) return; // ignore garbage timestamps
+        if (dt <= 0 || dt > 0.2) return; // ignore garbage intervals
 
         // rotationRate is in deg/s on iOS. Convert to rad and integrate.
         const D2R = Math.PI / 180;
@@ -648,8 +654,12 @@
         const dPitch = (rr.beta  || 0) * D2R * dt;
         const dYaw   = (rr.gamma || 0) * D2R * dt;
 
-        GS.cumPitch += dPitch;
-        GS.cumYaw   += dYaw;
+        // Decay the integrator first to prevent gyro bias drift. Per-event
+        // factor 0.998 at 60Hz → time constant ~8s. Slow enough that real
+        // motion still integrates correctly within a single jitter cycle,
+        // fast enough to bound long-term drift.
+        GS.cumPitch = GS.cumPitch * GS.cumDecay + dPitch;
+        GS.cumYaw   = GS.cumYaw   * GS.cumDecay + dYaw;
         GS.smPitch = GS.alpha * GS.smPitch + (1 - GS.alpha) * GS.cumPitch;
         GS.smYaw   = GS.alpha * GS.smYaw   + (1 - GS.alpha) * GS.cumYaw;
       };

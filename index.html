@@ -468,6 +468,15 @@
           </div>
         </div>
         <div style="height:6px"></div>
+        <h3>Smoothing</h3>
+        <div class="row">
+          <div>
+            <div class="label">Reduce shake</div>
+            <div class="hint">Software stabilization in the canvas</div>
+          </div>
+          <div class="toggle on" id="stabToggle"></div>
+        </div>
+        <div style="height:6px"></div>
         <h3>Quality</h3>
         <div class="seg" id="qualitySeg">
           <button data-q="720">720p</button>
@@ -523,7 +532,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v5';
+    const APP_VERSION = 'v6';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -562,6 +571,96 @@
 
     state.ctx = state.canvas.getContext('2d', { alpha: false });
 
+    // ─── Software stabilization ─────────────────────────────
+    // iOS Safari's getUserMedia bypasses Apple's enhanced video stabilization
+    // (Camera app only — not exposed to web). OIS still works at the lens but
+    // hand-shake jitter comes through. We compensate in the canvas pipeline:
+    // measure inter-frame motion via downsampled block-matching, then counter-
+    // translate the source rect with a low-pass filter so jitter cancels but
+    // intentional pans drift through.
+    const ME = {
+      enabled: true,
+      W: 64, H: 36,
+      canvas: document.createElement('canvas'),
+      ctx: null,
+      prev: null,         // Uint8Array of last frame's luminance
+      accDx: 0, accDy: 0, // accumulated apparent scene motion (in source px)
+      decay: 0.86,        // pulls accumulator back to zero so real pans drift through
+      zoom: 1.10,         // 10% crop margin — lets us shift up to ±5% without black edges
+    };
+    ME.canvas.width = ME.W;
+    ME.canvas.height = ME.H;
+    ME.ctx = ME.canvas.getContext('2d', { willReadFrequently: true });
+
+    function resetStabilizer() {
+      ME.prev = null;
+      ME.accDx = 0;
+      ME.accDy = 0;
+    }
+
+    function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+    // Estimate global translation between this frame and the previous one,
+    // update the accumulator, return [shiftSourceX, shiftSourceY, zoom] in
+    // source-pixel coords for drawCover to apply.
+    function measureAndAccumulate(video) {
+      if (!ME.enabled || !video || video.readyState < 2) return null;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return null;
+
+      ME.ctx.drawImage(video, 0, 0, ME.W, ME.H);
+      const img = ME.ctx.getImageData(0, 0, ME.W, ME.H).data;
+      const cur = new Uint8Array(ME.W * ME.H);
+      for (let i = 0, j = 0; i < img.length; i += 4, j++) {
+        cur[j] = (img[i] + img[i + 1] + img[i + 2]) / 3;
+      }
+
+      if (!ME.prev) {
+        ME.prev = cur;
+        return [0, 0, ME.zoom];
+      }
+
+      // Block-matching: find (dx, dy) minimizing SAD between cur and prev.
+      // dx, dy are in ME-pixel units; we sub-sample by 2 for speed.
+      const SR = 4;
+      let bestDx = 0, bestDy = 0, bestSAD = Infinity;
+      for (let dy = -SR; dy <= SR; dy++) {
+        for (let dx = -SR; dx <= SR; dx++) {
+          let sad = 0;
+          for (let y = SR; y < ME.H - SR; y += 2) {
+            const cRow = y * ME.W;
+            const pRow = (y + dy) * ME.W;
+            for (let x = SR; x < ME.W - SR; x += 2) {
+              sad += Math.abs(cur[cRow + x] - ME.prev[pRow + x + dx]);
+            }
+          }
+          if (sad < bestSAD) { bestSAD = sad; bestDx = dx; bestDy = dy; }
+        }
+      }
+      ME.prev = cur;
+
+      // Convert ME-pixel motion to source-pixel motion. Sign flip: bestDx
+      // is the offset where prev's content lives in cur's coords, so the
+      // "scene shifted by" amount is -bestDx in display orientation.
+      const sxScale = vw / ME.W;
+      const syScale = vh / ME.H;
+      const measuredDx = -bestDx * sxScale;
+      const measuredDy = -bestDy * syScale;
+
+      // Low-pass IIR: jitter (mean ≈ 0) gets cancelled, sustained pan drifts back to 0.
+      ME.accDx = ME.accDx * ME.decay + measuredDx;
+      ME.accDy = ME.accDy * ME.decay + measuredDy;
+
+      // Clamp inside the safety margin (zoom-1)/2 so we never reveal black edges.
+      const margin = 0.5 * (ME.zoom - 1);
+      const maxDx = vw * margin;
+      const maxDy = vh * margin;
+      ME.accDx = clamp(ME.accDx, -maxDx, maxDx);
+      ME.accDy = clamp(ME.accDy, -maxDy, maxDy);
+
+      return [ME.accDx, ME.accDy, ME.zoom];
+    }
+
     // iOS detection — Safari can only run one camera and benefits from lighter pipeline
     const _ua = navigator.userAgent || '';
     state.isIOS = /iPad|iPhone|iPod/.test(_ua) ||
@@ -591,6 +690,9 @@
       const v = {
         width:  { ideal: q === 2160 ? 3840 : q === 1080 ? 1920 : 1280 },
         height: { ideal: q === 2160 ? 2160 : q === 1080 ? 1080 : 720 },
+        // Lock to 30fps. iOS sometimes picks a steadier sensor mode at a
+        // fixed framerate; also matches our canvas captureStream(30).
+        frameRate: { ideal: 30, max: 30 },
       };
       if (facingOrId.deviceId) v.deviceId = { exact: facingOrId.deviceId };
       else                     v.facingMode = { ideal: facingOrId.facing };
@@ -740,6 +842,9 @@
           await waitForVideoReady(state.videoA);
           // Resize canvas in case the new camera reports a different native res
           sizeCanvasToSource();
+          // Different camera = different scene, reset the stabilizer baseline
+          // so the first frame after flip doesn't trigger a giant false motion.
+          resetStabilizer();
           stopStream(old);
         } else {
           // Dual: just swap which slot is main
@@ -838,12 +943,16 @@
                        state.streamB &&
                        state.videoB.readyState >= 2;
 
+      // Estimate motion on the main feed only — the PiP/half thumbnail doesn't
+      // need stabilization (small, glanced at, would double the cost).
+      const stab = measureAndAccumulate(main.video);
+
       if (state.layout === 'split' && dualLive) {
         // Top half: main, bottom half: second
-        drawCover(ctx, main.video, 0, 0, W, H / 2, main.mirror);
-        drawCover(ctx, second.video, 0, H / 2, W, H / 2, second.mirror);
+        drawCover(ctx, main.video, 0, 0, W, H / 2, main.mirror, stab);
+        drawCover(ctx, second.video, 0, H / 2, W, H / 2, second.mirror, null);
       } else if (state.layout === 'pip' && dualLive) {
-        drawCover(ctx, main.video, 0, 0, W, H, main.mirror);
+        drawCover(ctx, main.video, 0, 0, W, H, main.mirror, stab);
         // PiP overlay top-right, ~28% width, with rounded mask
         const pw = Math.round(W * 0.28);
         const ph = Math.round(pw * 16 / 9);
@@ -852,11 +961,11 @@
         drawCoverRounded(ctx, second.video, px, py, pw, ph, Math.round(pw * 0.08), second.mirror);
       } else {
         // Single mode (or dual not yet active)
-        drawCover(ctx, main.video, 0, 0, W, H, main.mirror);
+        drawCover(ctx, main.video, 0, 0, W, H, main.mirror, stab);
       }
     }
 
-    function drawCover(ctx, video, x, y, w, h, mirror) {
+    function drawCover(ctx, video, x, y, w, h, mirror, stab) {
       if (!video || video.readyState < 2) return;
       const vw = video.videoWidth;
       const vh = video.videoHeight;
@@ -875,6 +984,17 @@
         sh = vw / targetRatio;
         sx = 0;
         sy = (vh - sh) / 2;
+      }
+      // Stabilization: shrink source rect by `zoom`, then shift by accumulated
+      // motion to counter shake. The shrink gives us margin to shift inside.
+      if (stab) {
+        const [shX, shY, zoom] = stab;
+        const zsw = sw / zoom;
+        const zsh = sh / zoom;
+        sx = sx + (sw - zsw) / 2 + shX;
+        sy = sy + (sh - zsh) / 2 + shY;
+        sw = zsw;
+        sh = zsh;
       }
       ctx.save();
       if (mirror) {
@@ -1147,6 +1267,13 @@
           await startPrimary();
         }
       });
+    });
+
+    // Stabilization toggle
+    $('stabToggle').addEventListener('click', () => {
+      ME.enabled = !ME.enabled;
+      $('stabToggle').classList.toggle('on', ME.enabled);
+      if (!ME.enabled) resetStabilizer();
     });
 
     // Auto-flip toggle

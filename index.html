@@ -472,7 +472,7 @@
         <div class="row">
           <div>
             <div class="label">Reduce shake (beta)</div>
-            <div class="hint">Off by default — try if you want smoother handheld</div>
+            <div class="hint">Uses phone gyroscope — asks for motion access</div>
           </div>
           <div class="toggle" id="stabToggle"></div>
         </div>
@@ -532,7 +532,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v7';
+    const APP_VERSION = 'v8';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -571,120 +571,132 @@
 
     state.ctx = state.canvas.getContext('2d', { alpha: false });
 
-    // ─── Software stabilization ─────────────────────────────
+    // ─── Gyro stabilization ─────────────────────────────────
     // iOS Safari's getUserMedia bypasses Apple's enhanced video stabilization
-    // (Camera app only — not exposed to web). OIS still works at the lens but
-    // hand-shake jitter comes through. We compensate in the canvas pipeline:
-    // proper deshaker — track cumulative camera trajectory, low-pass it to
-    // get the "intended" trajectory, apply (intended - actual) to the source
-    // rect. Jitter cancels because intended ≈ 0 while actual oscillates;
-    // sustained pan tracks (intended catches up to actual after a few frames).
+    // (Camera-app only — not exposed to web). The phone's gyroscope IS exposed
+    // (DeviceMotionEvent at ~60Hz), so we use that as a hand-shake signal:
+    //   1. Integrate per-event rotation rates into a cumulative orientation
+    //   2. Low-pass that to get an "intended" smoothed orientation
+    //   3. Compensation in source pixels = (cum - smoothed) * focalPx
+    //   4. Counter-translate the source rect by that compensation
+    // Beats image-based motion estimation: 60Hz events vs 30Hz frames, no
+    // false matches in low-texture areas, ~zero CPU cost.
     //
-    // EXPERIMENTAL — disabled by default (v6 attempt was unstable on iOS).
-    const ME = {
+    // EXPERIMENTAL — off by default. Toggle requests motion permission on iOS.
+    const GS = {
       enabled: false,
-      W: 96, H: 54,
-      canvas: document.createElement('canvas'),
-      ctx: null,
-      prev: null,         // Uint8Array of last frame's luminance
-      cumX: 0, cumY: 0,   // cumulative camera trajectory (source pixels)
-      smX: 0,  smY: 0,    // low-pass smoothed trajectory (source pixels)
-      alpha: 0.94,        // smoothing factor — higher = stiffer, more lag
-      zoom: 1.12,         // 12% crop margin — allows ±6% compensation shift
+      permGranted: false,
+      handler: null,
+      lastEventT: 0,
+      // Cumulative rotation around each phone axis (radians). Only short-term
+      // delta matters for stabilization, but absolute values are bounded by
+      // the smoothing+anti-windup so they can't drift forever.
+      cumPitch: 0, cumYaw: 0,
+      smPitch: 0,  smYaw: 0,
+      alpha: 0.92,        // smoothing — higher = stiffer; 0.92 ≈ 12-frame lag at 60Hz
+      fovDeg: 65,         // assumed horizontal FOV — tweak if compensation feels off
+      zoom: 1.14,         // 14% crop margin → ±7% shift headroom
+      // Sign flags so we can flip without re-deriving the rotation math.
+      // Derivation for back camera, phone in portrait:
+      //   +gamma (yaw) → camera looks LEFT → scene moves RIGHT in source
+      //   to follow the smoothed orientation we shift sx in the SAME direction
+      //   the scene moved → +1 is the analytically correct sign.
+      // Same logic for pitch. If shake gets worse on toggle, both flip to -1.
+      sgnX: +1,
+      sgnY: +1,
     };
-    ME.canvas.width = ME.W;
-    ME.canvas.height = ME.H;
-    ME.ctx = ME.canvas.getContext('2d', { willReadFrequently: true });
 
     function resetStabilizer() {
-      ME.prev = null;
-      ME.cumX = 0; ME.cumY = 0;
-      ME.smX = 0;  ME.smY = 0;
+      GS.cumPitch = 0; GS.cumYaw = 0;
+      GS.smPitch  = 0; GS.smYaw  = 0;
+      GS.lastEventT = 0;
     }
 
     function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-    // Estimate global motion between this and the previous frame, update the
-    // trajectory + smoothed trajectory, return [shiftSourceX, shiftSourceY,
-    // zoom] for drawCover to apply.
+    async function requestMotionPermission() {
+      if (typeof DeviceMotionEvent === 'undefined') return false;
+      // iOS 13+ Safari requires explicit permission, called from a user gesture.
+      if (typeof DeviceMotionEvent.requestPermission === 'function') {
+        try {
+          const result = await DeviceMotionEvent.requestPermission();
+          return result === 'granted';
+        } catch {
+          return false;
+        }
+      }
+      // Android / older iOS: no prompt, gyroscope works directly.
+      return true;
+    }
+
+    function startGyroListener() {
+      if (GS.handler) return;
+      GS.handler = (e) => {
+        if (!GS.enabled) return;
+        const rr = e.rotationRate;
+        if (!rr) return;
+        const now = e.timeStamp || performance.now();
+        const dt = GS.lastEventT ? (now - GS.lastEventT) / 1000 : 1 / 60;
+        GS.lastEventT = now;
+        if (dt <= 0 || dt > 0.2) return; // ignore garbage timestamps
+
+        // rotationRate is in deg/s on iOS. Convert to rad and integrate.
+        const D2R = Math.PI / 180;
+        // beta  = rate around phone X axis → camera pitch (tilt up/down)
+        // gamma = rate around phone Y axis → camera yaw (pan left/right)
+        // (alpha = roll around Z axis — handled later if needed)
+        const dPitch = (rr.beta  || 0) * D2R * dt;
+        const dYaw   = (rr.gamma || 0) * D2R * dt;
+
+        GS.cumPitch += dPitch;
+        GS.cumYaw   += dYaw;
+        GS.smPitch = GS.alpha * GS.smPitch + (1 - GS.alpha) * GS.cumPitch;
+        GS.smYaw   = GS.alpha * GS.smYaw   + (1 - GS.alpha) * GS.cumYaw;
+      };
+      window.addEventListener('devicemotion', GS.handler);
+    }
+
+    function stopGyroListener() {
+      if (!GS.handler) return;
+      window.removeEventListener('devicemotion', GS.handler);
+      GS.handler = null;
+      resetStabilizer();
+    }
+
+    // Called every draw frame. Returns [offsetX, offsetY, zoom] in source-
+    // pixel coords, or null when stabilization is off.
     function measureAndAccumulate(video) {
-      if (!ME.enabled || !video || video.readyState < 2) return null;
+      if (!GS.enabled || !video || video.readyState < 2) return null;
       const vw = video.videoWidth, vh = video.videoHeight;
       if (!vw || !vh) return null;
 
-      ME.ctx.drawImage(video, 0, 0, ME.W, ME.H);
-      const img = ME.ctx.getImageData(0, 0, ME.W, ME.H).data;
-      const cur = new Uint8Array(ME.W * ME.H);
-      for (let i = 0, j = 0; i < img.length; i += 4, j++) {
-        cur[j] = (img[i] + img[i + 1] + img[i + 2]) / 3;
-      }
+      // Convert rotation in radians to source-pixel offset using assumed FOV.
+      // For small angles, image translation ≈ rotation * focal_length_in_pixels.
+      const fovRad = GS.fovDeg * Math.PI / 180;
+      const focalPx = (vw / 2) / Math.tan(fovRad / 2);
 
-      if (!ME.prev) {
-        ME.prev = cur;
-        return [0, 0, ME.zoom];
-      }
+      // Compensation = cumulative - smoothed. For high-frequency jitter
+      // (cum oscillates around 0, smoothed ≈ 0), this ≈ cum, which we apply
+      // back to the source rect to cancel the shake.
+      const dPitch = GS.cumPitch - GS.smPitch;
+      const dYaw   = GS.cumYaw   - GS.smYaw;
 
-      // Block-matching: find (dx, dy) minimizing SAD between cur and prev,
-      // where cur[y, x] ≈ prev[y+dy, x+dx]. So bestDx > 0 means the scene
-      // moved LEFT in source (camera moved right). dx, dy are in ME pixels;
-      // sub-sample by 2 for speed.
-      const SR = 4;
-      let bestDx = 0, bestDy = 0, bestSAD = Infinity;
-      for (let dy = -SR; dy <= SR; dy++) {
-        for (let dx = -SR; dx <= SR; dx++) {
-          let sad = 0;
-          for (let y = SR; y < ME.H - SR; y += 2) {
-            const cRow = y * ME.W;
-            const pRow = (y + dy) * ME.W;
-            for (let x = SR; x < ME.W - SR; x += 2) {
-              sad += Math.abs(cur[cRow + x] - ME.prev[pRow + x + dx]);
-            }
-          }
-          if (sad < bestSAD) { bestSAD = sad; bestDx = dx; bestDy = dy; }
-        }
-      }
-      ME.prev = cur;
+      let offsetX = GS.sgnX * dYaw   * focalPx;
+      let offsetY = GS.sgnY * dPitch * focalPx;
 
-      // Reject estimates pegged at the search edge — those are usually
-      // false matches (scene change, lighting flicker) and produce huge
-      // bogus motion. Treat as zero motion.
-      if (Math.abs(bestDx) === SR || Math.abs(bestDy) === SR) {
-        bestDx = 0; bestDy = 0;
-      }
-
-      // Per-frame camera motion in source pixels (rightward camera = +)
-      const sxScale = vw / ME.W;
-      const syScale = vh / ME.H;
-      const dxFrame = bestDx * sxScale;
-      const dyFrame = bestDy * syScale;
-
-      // Update cumulative camera trajectory and its smoothed version.
-      ME.cumX += dxFrame;
-      ME.cumY += dyFrame;
-      ME.smX = ME.alpha * ME.smX + (1 - ME.alpha) * ME.cumX;
-      ME.smY = ME.alpha * ME.smY + (1 - ME.alpha) * ME.cumY;
-
-      // Compensation = (smoothed trajectory) - (actual trajectory). For
-      // high-frequency jitter (cum oscillates around 0, sm ≈ 0), this is
-      // ≈ -cum, which exactly cancels the jitter. For sustained pan, sm
-      // catches up to cum and compensation settles to a constant offset.
-      let compX = ME.smX - ME.cumX;
-      let compY = ME.smY - ME.cumY;
-
-      // Clamp inside the safety margin so the cropped source rect never
-      // spills outside the frame. Use a hair less than the geometric max.
-      const margin = 0.5 * (1 - 1 / ME.zoom) - 0.005;
+      // Clamp inside the safety margin so the cropped rect never spills out.
+      const margin = 0.5 * (1 - 1 / GS.zoom) - 0.005;
       const maxDx = vw * margin;
       const maxDy = vh * margin;
-      compX = clamp(compX, -maxDx, maxDx);
-      compY = clamp(compY, -maxDy, maxDy);
+      const clampedX = clamp(offsetX, -maxDx, maxDx);
+      const clampedY = clamp(offsetY, -maxDy, maxDy);
 
-      // Anti-windup: when compensation hits the clamp, pull cumX toward smX
-      // so we don't accumulate forever beyond what we can correct.
-      if (compX === maxDx || compX === -maxDx) ME.cumX = ME.smX - compX;
-      if (compY === maxDy || compY === -maxDy) ME.cumY = ME.smY - compY;
+      // Anti-windup: if we've saturated the compensation, pull cum toward
+      // smoothed so we don't keep drifting beyond what we can correct.
+      if (clampedX !== offsetX) GS.cumYaw   = GS.smYaw   + (GS.sgnX * clampedX) / focalPx;
+      if (clampedY !== offsetY) GS.cumPitch = GS.smPitch + (GS.sgnY * clampedY) / focalPx;
 
-      return [compX, compY, ME.zoom];
+      return [clampedX, clampedY, GS.zoom];
     }
 
     // iOS detection — Safari can only run one camera and benefits from lighter pipeline
@@ -1295,11 +1307,28 @@
       });
     });
 
-    // Stabilization toggle
-    $('stabToggle').addEventListener('click', () => {
-      ME.enabled = !ME.enabled;
-      $('stabToggle').classList.toggle('on', ME.enabled);
-      if (!ME.enabled) resetStabilizer();
+    // Stabilization toggle (gyro-based)
+    $('stabToggle').addEventListener('click', async () => {
+      const turningOn = !GS.enabled;
+      if (turningOn) {
+        if (!GS.permGranted) {
+          const ok = await requestMotionPermission();
+          if (!ok) {
+            toast("Motion access denied — can't stabilize without it");
+            return;
+          }
+          GS.permGranted = true;
+        }
+        GS.enabled = true;
+        resetStabilizer();
+        startGyroListener();
+        $('stabToggle').classList.add('on');
+        toast('Smoothing on');
+      } else {
+        GS.enabled = false;
+        stopGyroListener();
+        $('stabToggle').classList.remove('on');
+      }
     });
 
     // Auto-flip toggle
@@ -1327,6 +1356,24 @@
     $('saveBtn').addEventListener('click', saveRecording);
     $('newBtn').addEventListener('click', closeResult);
     $('closeBtn').addEventListener('click', closeResult);
+
+    // Hidden escape hatch: triple-tap the version pill to flip stabilizer
+    // signs. If gyro signs are inverted on a particular device/orientation,
+    // smoothing makes shake WORSE — three taps and try again.
+    let _vTaps = [];
+    $('versionPill').style.pointerEvents = 'auto';
+    $('versionPill').addEventListener('click', () => {
+      const now = Date.now();
+      _vTaps = _vTaps.filter(t => now - t < 700);
+      _vTaps.push(now);
+      if (_vTaps.length >= 3) {
+        _vTaps = [];
+        GS.sgnX *= -1;
+        GS.sgnY *= -1;
+        resetStabilizer();
+        toast(`Stab signs: x=${GS.sgnX > 0 ? '+' : '−'} y=${GS.sgnY > 0 ? '+' : '−'}`, 2500);
+      }
+    });
 
     // Wake-lock during recording (keeps screen on)
     let wakeLock = null;

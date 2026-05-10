@@ -471,10 +471,10 @@
         <h3>Smoothing</h3>
         <div class="row">
           <div>
-            <div class="label">Reduce shake</div>
-            <div class="hint">Software stabilization in the canvas</div>
+            <div class="label">Reduce shake (beta)</div>
+            <div class="hint">Off by default — try if you want smoother handheld</div>
           </div>
-          <div class="toggle on" id="stabToggle"></div>
+          <div class="toggle" id="stabToggle"></div>
         </div>
         <div style="height:6px"></div>
         <h3>Quality</h3>
@@ -532,7 +532,7 @@
 
   <script>
     // ─── App version (bump manually on ship) ─────────────────
-    const APP_VERSION = 'v6';
+    const APP_VERSION = 'v7';
     document.getElementById('versionPill').textContent = APP_VERSION;
 
     // ─── State ──────────────────────────────────────────────
@@ -575,18 +575,22 @@
     // iOS Safari's getUserMedia bypasses Apple's enhanced video stabilization
     // (Camera app only — not exposed to web). OIS still works at the lens but
     // hand-shake jitter comes through. We compensate in the canvas pipeline:
-    // measure inter-frame motion via downsampled block-matching, then counter-
-    // translate the source rect with a low-pass filter so jitter cancels but
-    // intentional pans drift through.
+    // proper deshaker — track cumulative camera trajectory, low-pass it to
+    // get the "intended" trajectory, apply (intended - actual) to the source
+    // rect. Jitter cancels because intended ≈ 0 while actual oscillates;
+    // sustained pan tracks (intended catches up to actual after a few frames).
+    //
+    // EXPERIMENTAL — disabled by default (v6 attempt was unstable on iOS).
     const ME = {
-      enabled: true,
-      W: 64, H: 36,
+      enabled: false,
+      W: 96, H: 54,
       canvas: document.createElement('canvas'),
       ctx: null,
       prev: null,         // Uint8Array of last frame's luminance
-      accDx: 0, accDy: 0, // accumulated apparent scene motion (in source px)
-      decay: 0.86,        // pulls accumulator back to zero so real pans drift through
-      zoom: 1.10,         // 10% crop margin — lets us shift up to ±5% without black edges
+      cumX: 0, cumY: 0,   // cumulative camera trajectory (source pixels)
+      smX: 0,  smY: 0,    // low-pass smoothed trajectory (source pixels)
+      alpha: 0.94,        // smoothing factor — higher = stiffer, more lag
+      zoom: 1.12,         // 12% crop margin — allows ±6% compensation shift
     };
     ME.canvas.width = ME.W;
     ME.canvas.height = ME.H;
@@ -594,15 +598,15 @@
 
     function resetStabilizer() {
       ME.prev = null;
-      ME.accDx = 0;
-      ME.accDy = 0;
+      ME.cumX = 0; ME.cumY = 0;
+      ME.smX = 0;  ME.smY = 0;
     }
 
     function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-    // Estimate global translation between this frame and the previous one,
-    // update the accumulator, return [shiftSourceX, shiftSourceY, zoom] in
-    // source-pixel coords for drawCover to apply.
+    // Estimate global motion between this and the previous frame, update the
+    // trajectory + smoothed trajectory, return [shiftSourceX, shiftSourceY,
+    // zoom] for drawCover to apply.
     function measureAndAccumulate(video) {
       if (!ME.enabled || !video || video.readyState < 2) return null;
       const vw = video.videoWidth, vh = video.videoHeight;
@@ -620,8 +624,10 @@
         return [0, 0, ME.zoom];
       }
 
-      // Block-matching: find (dx, dy) minimizing SAD between cur and prev.
-      // dx, dy are in ME-pixel units; we sub-sample by 2 for speed.
+      // Block-matching: find (dx, dy) minimizing SAD between cur and prev,
+      // where cur[y, x] ≈ prev[y+dy, x+dx]. So bestDx > 0 means the scene
+      // moved LEFT in source (camera moved right). dx, dy are in ME pixels;
+      // sub-sample by 2 for speed.
       const SR = 4;
       let bestDx = 0, bestDy = 0, bestSAD = Infinity;
       for (let dy = -SR; dy <= SR; dy++) {
@@ -639,26 +645,46 @@
       }
       ME.prev = cur;
 
-      // Convert ME-pixel motion to source-pixel motion. Sign flip: bestDx
-      // is the offset where prev's content lives in cur's coords, so the
-      // "scene shifted by" amount is -bestDx in display orientation.
+      // Reject estimates pegged at the search edge — those are usually
+      // false matches (scene change, lighting flicker) and produce huge
+      // bogus motion. Treat as zero motion.
+      if (Math.abs(bestDx) === SR || Math.abs(bestDy) === SR) {
+        bestDx = 0; bestDy = 0;
+      }
+
+      // Per-frame camera motion in source pixels (rightward camera = +)
       const sxScale = vw / ME.W;
       const syScale = vh / ME.H;
-      const measuredDx = -bestDx * sxScale;
-      const measuredDy = -bestDy * syScale;
+      const dxFrame = bestDx * sxScale;
+      const dyFrame = bestDy * syScale;
 
-      // Low-pass IIR: jitter (mean ≈ 0) gets cancelled, sustained pan drifts back to 0.
-      ME.accDx = ME.accDx * ME.decay + measuredDx;
-      ME.accDy = ME.accDy * ME.decay + measuredDy;
+      // Update cumulative camera trajectory and its smoothed version.
+      ME.cumX += dxFrame;
+      ME.cumY += dyFrame;
+      ME.smX = ME.alpha * ME.smX + (1 - ME.alpha) * ME.cumX;
+      ME.smY = ME.alpha * ME.smY + (1 - ME.alpha) * ME.cumY;
 
-      // Clamp inside the safety margin (zoom-1)/2 so we never reveal black edges.
-      const margin = 0.5 * (ME.zoom - 1);
+      // Compensation = (smoothed trajectory) - (actual trajectory). For
+      // high-frequency jitter (cum oscillates around 0, sm ≈ 0), this is
+      // ≈ -cum, which exactly cancels the jitter. For sustained pan, sm
+      // catches up to cum and compensation settles to a constant offset.
+      let compX = ME.smX - ME.cumX;
+      let compY = ME.smY - ME.cumY;
+
+      // Clamp inside the safety margin so the cropped source rect never
+      // spills outside the frame. Use a hair less than the geometric max.
+      const margin = 0.5 * (1 - 1 / ME.zoom) - 0.005;
       const maxDx = vw * margin;
       const maxDy = vh * margin;
-      ME.accDx = clamp(ME.accDx, -maxDx, maxDx);
-      ME.accDy = clamp(ME.accDy, -maxDy, maxDy);
+      compX = clamp(compX, -maxDx, maxDx);
+      compY = clamp(compY, -maxDy, maxDy);
 
-      return [ME.accDx, ME.accDy, ME.zoom];
+      // Anti-windup: when compensation hits the clamp, pull cumX toward smX
+      // so we don't accumulate forever beyond what we can correct.
+      if (compX === maxDx || compX === -maxDx) ME.cumX = ME.smX - compX;
+      if (compY === maxDy || compY === -maxDy) ME.cumY = ME.smY - compY;
+
+      return [compX, compY, ME.zoom];
     }
 
     // iOS detection — Safari can only run one camera and benefits from lighter pipeline
